@@ -1,0 +1,63 @@
+
+thread_count: solver count per node
+mpi_count: node count
+mpi_rank: node rank
+
+solver_count: total solver count,  (mpi_rank * thread_count)
+solver_rank: index + (thread_count * mpi_rank)
+
+ThreadLocal: Callback, Test_Callback
+	-prepareData
+		-sync between nodes
+	-syncData
+		-get Data from rank 0
+	-avgDiff
+		-gather diff inside node
+		-reduceSum between nodes
+		-avg in rank 0
+		-get Diff from rank 0
+	-sumTestDiff
+
+
+template<typename Dtype>
+void ThreadLocal<Dtype>::Run() {
+  Caffe::OMPI ompi = Caffe::ompi();
+  int thread_count = ompi.thread_count;
+  vector<ThreadLocal<Dtype>* > locals(thread_count);
+
+  for(int i = 1; i < thread_count; i++){
+      Caffe::set_solver_rank(i + ompi.mpi_rank * thread_count);
+      SolverParameter param(solver_->param());
+      param.set_type(solver_->type());
+      shared_ptr<Solver<Dtype> > s(SolverRegistry<Dtype>::CreateSolver(param));
+      ThreadLocal<Dtype> *local = new ThreadLocal<Dtype>(s);
+      locals[i] = local;
+  }
+
+  Caffe::set_solver_rank(ompi.mpi_rank * thread_count);
+  locals[0] = this;
+
+#pragma omp parallel num_threads(thread_count)
+  {
+      Caffe::set_ompi(ompi);
+      int rank = omp_get_thread_num();
+      Caffe::set_solver_rank(rank + ompi.mpi_rank * thread_count);
+      Caffe::set_solver_count(ompi.mpi_count * thread_count);
+      ThreadLocal<Dtype> *local = locals[rank];
+      local->locals_ = &locals;
+
+      if(!rank) local->syncNodeData();
+#pragma omp barrier
+      if(rank) local->syncData();
+#pragma omp barrier
+      local->solver_->Solve();
+#pragma omp barrier
+	  LOG_IF(INFO, Caffe::root_solver()) << "RickDebug: In Run in omp.";
+  }
+
+  LOG_IF(INFO, Caffe::root_solver()) << "RickDebug: In Run out of omp.";
+  for(int i = 1; i < thread_count; i++){
+    delete locals[i];
+  }
+
+}
